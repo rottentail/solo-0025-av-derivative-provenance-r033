@@ -90,6 +90,54 @@ def make_y4m(
     return b"".join(parts)
 
 
+def make_interlaced_y4m(
+    *,
+    interlace: str,
+    width: int = 16,
+    height: int = 16,
+    frame_count: int = 4,
+    rate_numerator: int = 25,
+    rate_denominator: int = 1,
+) -> bytes:
+    """Build an interlaced stream whose rows encode their source field.
+
+    Even and odd scanlines use disjoint value ranges so a deinterlaced frame
+    can be proven to preserve the exact field scanlines captured at each
+    motion instant, in the order the field-order marker declares.
+    """
+
+    if interlace not in {"t", "b"}:
+        raise ValueError("interlace must be 't' or 'b' for this fixture.")
+    header = (
+        "YUV4MPEG2 "
+        f"W{width} H{height} "
+        f"F{rate_numerator}:{rate_denominator} "
+        f"I{interlace} C420jpeg\n"
+    ).encode("ascii")
+    chroma_width = width // 2
+    chroma_height = height // 2
+    parts = [header]
+    for frame_index in range(frame_count):
+        parts.append(b"FRAME\n")
+        y_plane = bytes(
+            (frame_index * 13 + (40 if y % 2 == 0 else 160) + x) % 256
+            for y in range(height)
+            for x in range(width)
+        )
+        u_plane = bytes(
+            (frame_index * 7 + (20 if y % 2 == 0 else 120) + x) % 256
+            for y in range(chroma_height)
+            for x in range(chroma_width)
+        )
+        v_plane = bytes(
+            (frame_index * 9 + (60 if y % 2 == 0 else 200) + x) % 256
+            for y in range(chroma_height)
+            for x in range(chroma_width)
+        )
+        parts.extend((y_plane, u_plane, v_plane))
+    return b"".join(parts)
+
+
 class HTTPClient:
     def __init__(self, host: str, port: int) -> None:
         self.host = host
@@ -393,6 +441,302 @@ def run_verify_reproduction(
     }
 
 
+def run_deinterlace_video(
+    client: HTTPClient,
+    server: ProvenanceHTTPServer,
+) -> dict[str, Any]:
+    from avprovenance.media.y4m import decode_y4m
+
+    frame_count = 4
+    width = height = 16
+    rate_n = 25
+    results: dict[str, Any] = {"workflow": "deinterlace-video", "orders": {}}
+
+    for order, top_first in (("t", True), ("b", False)):
+        source_bytes = make_interlaced_y4m(
+            interlace=order,
+            width=width,
+            height=height,
+            frame_count=frame_count,
+            rate_numerator=rate_n,
+        )
+        source = client.upload(f"interlaced-{order}.y4m", source_bytes)
+        source_props = source["descriptor"]["properties"]
+        require_equal(source_props["interlace"], order, f"{order}: source field order")
+
+        rendition = client.create_rendition(
+            {
+                "primary_asset_id": source["id"],
+                "output_name": f"progressive-{order}.y4m",
+                "operations": [
+                    # A crop before deinterlacing must not change the field
+                    # rhythm or reverse the output order.
+                    {
+                        "type": "video_crop",
+                        "x": 2,
+                        "y": 4,
+                        "width": 12,
+                        "height": 8,
+                    },
+                    {"type": "video_deinterlace"},
+                    {"type": "video_mirror"},
+                ],
+            }
+        )
+        require_equal(rendition["status"], "completed", f"{order}: rendition status")
+        props = rendition["output_asset"]["descriptor"]["properties"]
+        require_equal(props["interlace"], "p", f"{order}: output is progressive")
+        require_equal(
+            props["frame_count"],
+            frame_count * 2,
+            f"{order}: one progressive frame per field",
+        )
+        require_equal(
+            props["rate_numerator"],
+            rate_n * 2,
+            f"{order}: frame rate doubled",
+        )
+        require_equal(props["rate_denominator"], 1, f"{order}: rate denominator kept")
+        source_duration = frame_count / rate_n
+        output_duration = props["frame_count"] / props["rate_numerator"]
+        require(
+            abs(source_duration - output_duration) < 1e-12,
+            f"{order}: playback duration preserved",
+        )
+        require_equal(
+            props["duration_seconds"],
+            round(source_duration, 9),
+            f"{order}: descriptor duration",
+        )
+
+        # Integrity replay must reproduce the exact bytes and descriptor.
+        check_status, check = client.request(
+            "POST",
+            f"/v1/renditions/{rendition['id']}/integrity-checks",
+            {},
+        )
+        require_equal(check_status, 201, f"{order}: integrity status")
+        require_equal(check["status"], "verified", f"{order}: integrity verified")
+        require_equal(
+            check["expected_digest"],
+            check["reproduced_digest"],
+            f"{order}: replayed digest",
+        )
+
+        # Pixel-level proof via the stored content-addressed bytes.
+        output_asset = server.application.repository.get_asset(
+            rendition["output_asset"]["id"]
+        )
+        output_bytes = server.application.content_files.read(
+            output_asset.content_key
+        )
+        source_clip = decode_y4m(source_bytes)
+        output_clip = decode_y4m(output_bytes)
+        crop_x, crop_y = 2, 4
+
+        def source_row(clip, frame_index, row):
+            plane = clip.frames[frame_index].y_plane
+            return plane[row * clip.width : (row + 1) * clip.width]
+
+        def output_row(clip, frame_index, row):
+            plane = clip.frames[frame_index].y_plane
+            return plane[row * clip.width : (row + 1) * clip.width]
+
+        for source_index in range(frame_count):
+            top_index = 2 * source_index + (0 if top_first else 1)
+            bottom_index = 2 * source_index + (1 if top_first else 0)
+
+            # Temporal order: the first emitted frame per source frame carries
+            # whichever field the header declares first.
+            first_is_top = output_clip.frames[2 * source_index] is output_clip.frames[
+                top_index
+            ]
+            require_equal(
+                first_is_top,
+                top_first,
+                f"{order}: emitted field order follows the field-order marker",
+            )
+
+            # Captured field scanlines survive the crop, then mirror, verbatim.
+            for output_row_index in range(0, output_clip.height, 2):
+                source_row_index = crop_y + output_row_index
+                expected = source_row(
+                    source_clip, source_index, source_row_index
+                )[crop_x : crop_x + output_clip.width][::-1]
+                require_equal(
+                    output_row(output_clip, top_index, output_row_index),
+                    expected,
+                    f"{order}: top field preserves its captured even scanlines",
+                )
+            for output_row_index in range(1, output_clip.height, 2):
+                source_row_index = crop_y + output_row_index
+                expected = source_row(
+                    source_clip, source_index, source_row_index
+                )[crop_x : crop_x + output_clip.width][::-1]
+                require_equal(
+                    output_row(output_clip, bottom_index, output_row_index),
+                    expected,
+                    f"{order}: bottom field preserves its captured odd scanlines",
+                )
+
+        # The progressive output re-entering the chain must be treated as
+        # already deinterlaced: a second deinterlace fails rather than
+        # splitting real progressive frames into fields again.
+        reentry_status, reentry = client.request(
+            "POST",
+            "/v1/renditions",
+            {
+                "primary_asset_id": rendition["output_asset"]["id"],
+                "output_name": f"re-deinterlace-{order}.y4m",
+                "operations": [{"type": "video_deinterlace"}],
+            },
+        )
+        require_equal(
+            reentry_status,
+            409,
+            f"{order}: re-deinterlace rejected at runtime",
+        )
+        require_equal(
+            reentry["error"]["details"]["reason"],
+            "VIDEO_DEINTERLACE_ALREADY_PROGRESSIVE",
+            f"{order}: re-deinterlace stable reason",
+        )
+
+        # A normal downstream derivative on the progressive output still works
+        # and keeps the progressive marker and doubled rhythm.
+        downstream = client.create_rendition(
+            {
+                "primary_asset_id": rendition["output_asset"]["id"],
+                "output_name": f"downstream-{order}.y4m",
+                "operations": [
+                    {"type": "media_trim", "start_frame": 1, "frame_count": 3},
+                    {
+                        "type": "video_crop",
+                        "x": 0,
+                        "y": 0,
+                        "width": 8,
+                        "height": 8,
+                    },
+                ],
+            }
+        )
+        downstream_props = downstream["output_asset"]["descriptor"]["properties"]
+        require_equal(
+            downstream_props["interlace"],
+            "p",
+            f"{order}: downstream stays progressive",
+        )
+        require_equal(
+            downstream_props["frame_count"],
+            3,
+            f"{order}: downstream trim frame count",
+        )
+        require_equal(
+            downstream_props["rate_numerator"],
+            rate_n * 2,
+            f"{order}: downstream keeps doubled rate",
+        )
+
+        results["orders"][order] = {
+            "rendition_id": rendition["id"],
+            "output_frames": props["frame_count"],
+            "rate_numerator": props["rate_numerator"],
+            "integrity": check["status"],
+        }
+
+    # A plan with two deinterlace operations is rejected before queuing.
+    duplicate_status, duplicate = client.request(
+        "POST",
+        "/v1/renditions",
+        {
+            "primary_asset_id": source["id"],
+            "output_name": "duplicate.y4m",
+            "operations": [
+                {"type": "video_deinterlace"},
+                {"type": "video_deinterlace"},
+            ],
+        },
+    )
+    require_equal(duplicate_status, 422, "duplicate deinterlace plan status")
+    require_equal(
+        duplicate["error"]["code"],
+        "PLAN_INVALID",
+        "duplicate deinterlace plan code",
+    )
+
+    # A progressive source cannot be deinterlaced (no fields exist).
+    progressive = client.upload(
+        "progressive-source.y4m",
+        make_y4m(width=16, height=16, frame_count=3, rate_numerator=25),
+    )
+    progressive_status, progressive_body = client.request(
+        "POST",
+        "/v1/renditions",
+        {
+            "primary_asset_id": progressive["id"],
+            "output_name": "bad-deinterlace.y4m",
+            "operations": [{"type": "video_deinterlace"}],
+        },
+    )
+    require_equal(
+        progressive_status,
+        409,
+        "progressive deinterlace runtime status",
+    )
+    require_equal(
+        progressive_body["error"]["details"]["reason"],
+        "VIDEO_DEINTERLACE_ALREADY_PROGRESSIVE",
+        "progressive deinterlace stable reason",
+    )
+
+    # Legacy path: a plan without the new operation keeps interlaced content
+    # byte-for-byte (the existing crop/mirror chain preserves the field flag).
+    legacy_source = client.upload(
+        "legacy-interlaced.y4m",
+        make_interlaced_y4m(interlace="t", frame_count=3),
+    )
+    legacy = client.create_rendition(
+        {
+            "primary_asset_id": legacy_source["id"],
+            "output_name": "legacy-preserved.y4m",
+            "operations": [
+                {
+                    "type": "video_crop",
+                    "x": 0,
+                    "y": 0,
+                    "width": 8,
+                    "height": 8,
+                },
+                {"type": "video_mirror"},
+            ],
+        }
+    )
+    legacy_props = legacy["output_asset"]["descriptor"]["properties"]
+    require_equal(
+        legacy_props["interlace"],
+        "t",
+        "legacy plan preserves the interlace field marker",
+    )
+    require_equal(
+        legacy_props["frame_count"],
+        3,
+        "legacy plan keeps the original frame count",
+    )
+    legacy_check_status, legacy_check = client.request(
+        "POST",
+        f"/v1/renditions/{legacy['id']}/integrity-checks",
+        {},
+    )
+    require_equal(
+        legacy_check["status"],
+        "verified",
+        "legacy interlaced rendition replays identically",
+    )
+    results["legacy_interlace"] = legacy_props["interlace"]
+    results["duplicate_plan_code"] = duplicate["error"]["code"]
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -401,6 +745,7 @@ def main() -> int:
             "ingest-media-asset",
             "execute-rendition",
             "verify-reproduction",
+            "deinterlace-video",
         ),
     )
     args = parser.parse_args()
@@ -410,6 +755,8 @@ def main() -> int:
             result = run_ingest_media_asset(client)
         elif args.workflow == "execute-rendition":
             result = run_execute_rendition(client)
+        elif args.workflow == "deinterlace-video":
+            result = run_deinterlace_video(client, server)
         else:
             result = run_verify_reproduction(client, server)
     print(json.dumps(result, sort_keys=True))

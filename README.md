@@ -13,7 +13,8 @@ FFmpeg, network access, credentials, or an online database.
 - Ingests one- or two-channel signed 16-bit PCM WAV.
 - Ingests planar 4:2:0 YUV4MPEG2 in the `C420` family.
 - Applies audio trim, gain, normalization, and two-source mixing.
-- Applies video trim, even-aligned crop, luma offset, and horizontal mirror.
+- Applies video trim, even-aligned crop, luma offset, horizontal mirror, and
+  motion-oriented deinterlacing into field-rate progressive frames.
 - Persists immutable assets, rendition state, provenance edges, and integrity
   checks.
 - Replays the stored operation plan and compares both bytes and media
@@ -93,6 +94,32 @@ Video-only operations:
 - `video_crop` with even `x`, `y`, `width`, and `height`
 - `video_luma_offset` with `amount`
 - `video_mirror`
+- `video_deinterlace` (no parameters)
+
+### Deinterlacing for motion content
+
+`video_deinterlace` turns an interlaced Y4M stream (header field order `It`
+for top-field-first or `Ib` for bottom-field-first) into a progressive stream
+that keeps every real motion instant. Each interlaced frame contributes two
+full-height progressive frames, one per field: the field's own scanlines are
+copied verbatim and only the missing scanlines are reconstructed from adjacent
+rows of the same field.
+
+- The output frame order follows the declared field order (`It` emits the top
+  field first, `Ib` the bottom field first), so motion never reverses for
+  either field order or after a later crop, mirror, or trim.
+- The frame rate doubles together with the frame count, so playback duration
+  is preserved exactly: the result neither speeds up nor slows down.
+- The output header is `Ip` (progressive). Feeding it back into another
+  `video_deinterlace` fails with `VIDEO_DEINTERLACE_ALREADY_PROGRESSIVE`
+  instead of splitting real progressive frames into fields a second time.
+- Progressive (`Ip`), unknown (`I?`), and mixed (`Im`) sources are rejected
+  with stable render errors, as are geometries or rates whose doubled result
+  would exceed the supported Y4M bounds. A plan may contain the operation at
+  most once.
+
+Plans that omit `video_deinterlace` keep the interlaced bytes and the original
+field-order marker exactly as before.
 
 ### Read rendition state
 
@@ -151,6 +178,15 @@ Video plan:
   },
   {"type": "video_luma_offset", "amount": 12},
   {"type": "video_mirror"}
+]
+```
+
+Interlaced-to-progressive plan (field-rate, duration preserving):
+
+```json
+[
+  {"type": "video_deinterlace"},
+  {"type": "media_trim", "start_frame": 2, "frame_count": 4}
 ]
 ```
 

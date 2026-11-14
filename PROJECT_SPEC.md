@@ -204,6 +204,21 @@ Video plans:
 - `video_crop`: even `x`, `y`, `width`, `height`
 - `video_luma_offset`: `amount`
 - `video_mirror`: no additional parameters
+- `video_deinterlace`: no additional parameters
+
+`video_deinterlace` is the motion-oriented progressive production path. It
+accepts only clips whose Y4M header declares a field order (`It` top-first or
+`Ib` bottom-first). Each interlaced frame is split into its two real fields,
+and every field is rebuilt into a full-height progressive frame by keeping its
+own scanlines and reconstructing the missing scanlines from adjacent same-field
+rows. The two field frames are emitted in the order the header declares, the
+frame rate doubles together with the frame count so playback duration is
+preserved exactly, and the output is tagged `Ip`. A progressive, unknown, or
+mixed source, an incompatible geometry, or a doubled result outside the Y4M
+bounds fails with a stable render code. The operation may appear at most once
+per plan. Re-ingesting its output into another deinterlace rendition fails
+instead of splitting progressive frames again. Plans without the operation
+still preserve interlaced bytes and their field-order marker unchanged.
 
 All numeric bounds are validated before state is queued. Processing functions
 also re-check data-dependent constraints so malformed persisted plans cannot
@@ -267,6 +282,7 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py deinterlace-video
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in

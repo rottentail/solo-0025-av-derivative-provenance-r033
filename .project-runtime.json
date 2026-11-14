@@ -18,6 +18,10 @@
     {
       "workflow_id": "verify-reproduction",
       "command": "python3 scripts/workflow_checks.py verify-reproduction"
+    },
+    {
+      "workflow_id": "deinterlace-video",
+      "command": "python3 scripts/workflow_checks.py deinterlace-video"
     }
   ]
 }

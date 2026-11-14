@@ -192,6 +192,11 @@ def _video_mirror(operation: dict[str, Any]) -> dict[str, Any]:
     return {"type": "video_mirror"}
 
 
+def _video_deinterlace(operation: dict[str, Any]) -> dict[str, Any]:
+    _only_keys(operation, {"type"}, "video_deinterlace")
+    return {"type": "video_deinterlace"}
+
+
 def _operation_validator(
     operation_type: str,
     media_kind: str,
@@ -210,6 +215,7 @@ def _operation_validator(
             "video_crop": _video_crop,
             "video_luma_offset": _video_luma,
             "video_mirror": _video_mirror,
+            "video_deinterlace": _video_deinterlace,
         }
     return validators.get(operation_type)
 
@@ -232,6 +238,7 @@ def compile_plan(
 
     normalized: list[dict[str, Any]] = []
     mixed = False
+    deinterlaced = False
     for index, raw in enumerate(raw_operations):
         operation = require_object(raw, f"operations[{index}]")
         operation_type = require_string(
@@ -244,6 +251,12 @@ def compile_plan(
                 raise PlanInvalid("audio_mix may appear only once.")
             normalized.append(_audio_mix(operation, has_secondary=has_secondary))
             mixed = True
+            continue
+        if media_kind == "video" and operation_type == "video_deinterlace":
+            if deinterlaced:
+                raise PlanInvalid("video_deinterlace may appear only once.")
+            normalized.append(_video_deinterlace(operation))
+            deinterlaced = True
             continue
 
         validator = _operation_validator(operation_type, media_kind)
